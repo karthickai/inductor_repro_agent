@@ -12,7 +12,7 @@ Read a GitHub issue from a local JSON file, write a repro script, run it 3 times
 ## Inputs
 
 - The **issue number** (e.g., `1`)
-- The **path to `issue.json`** (e.g., `~/workspace/inductor-agent/workdir/1/issue.json`)
+- The **path to `issue.json`** (e.g., `workdir/1/issue.json`)
 
 Replace `{N}` with the actual issue number in all commands.
 
@@ -29,10 +29,10 @@ No code blocks at all -> skip to step 5, write `classification: "NOT_REPRODUCED"
 ### 2. Write the repro script
 
 ```bash
-mkdir -p ~/workspace/inductor-agent/workdir/{N}
+mkdir -p workdir/{N}
 ```
 
-Write `~/workspace/inductor-agent/workdir/{N}/repro.py`:
+Write `workdir/{N}/repro.py`:
 - Complete, self-contained, all imports included
 - Use the exact code from the issue
 - Do NOT download model weights or datasets
@@ -40,7 +40,7 @@ Write `~/workspace/inductor-agent/workdir/{N}/repro.py`:
 ### 3. Run 3 times
 
 ```bash
-TORCH_INDUCTOR_DISABLE_CACHE=1 conda run -n pytorch-nightly python ~/workspace/inductor-agent/workdir/{N}/repro.py
+TORCH_INDUCTOR_DISABLE_CACHE=1 conda run -n pytorch-nightly python workdir/{N}/repro.py
 ```
 
 Classify:
@@ -57,11 +57,11 @@ If `DIFFERENT_ERROR` is fixable (missing import/package), fix and re-run (up to 
 
 ### 4. Identify affected areas
 
-Read `~/workspace/inductor-agent/codeowners.py`. Based on the traceback and error type, pick matching areas. Include them in `result.json`.
+Read `codeowners.py` (in the project root). Based on the traceback and error type, pick matching areas. Include them in `result.json`.
 
 ### 5. Write result.json
 
-Write `~/workspace/inductor-agent/workdir/{N}/result.json`:
+Write `workdir/{N}/result.json`:
 
 ```json
 {

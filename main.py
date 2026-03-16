@@ -21,6 +21,7 @@ from datetime import datetime, timedelta, timezone
 from codeowners import format_owner_tags
 from config import (
     AUTO_CLOSE_AFTER_MINUTES,
+    AUTO_CLOSE_GRACE_MINUTES,
     CLAUDE_TIMEOUT_SECONDS,
     GH_RETRY_ATTEMPTS,
     GITHUB_REPO,
@@ -119,6 +120,9 @@ def should_skip(issue_number: int) -> bool:
     return False
 
 
+_last_update_check: dict[str, datetime] = {}
+
+
 def _get_env_prefix() -> str | None:
     r = subprocess.run(["conda", "info", "--envs", "--json"], capture_output=True, text=True, timeout=30)
     if r.returncode != 0:
@@ -136,6 +140,10 @@ def _get_torch_version(env_prefix: str) -> str | None:
 
 
 def _is_nightly_stale(env_prefix: str) -> bool:
+    last_check = _last_update_check.get(env_prefix)
+    if last_check and (datetime.now(timezone.utc) - last_check) < timedelta(hours=NIGHTLY_MAX_AGE_HOURS):
+        logger.info("pytorch-nightly: already checked recently, treating as fresh")
+        return False
     version = _get_torch_version(env_prefix)
     if not version:
         return True
@@ -150,16 +158,21 @@ def _is_nightly_stale(env_prefix: str) -> bool:
 
 
 def _install_nightly(env_prefix: str) -> bool:
-    logger.info("Updating pytorch-nightly...")
+    old_version = _get_torch_version(env_prefix)
+    logger.info("Updating pytorch-nightly (current: %s)...", old_version)
     r = subprocess.run(
-        [os.path.join(env_prefix, "bin", "pip"), "install", "--pre", "--upgrade",
+        [os.path.join(env_prefix, "bin", "pip"), "install", "--pre",
          "torch", "torchvision", "torchaudio",
-         "--index-url", "https://download.pytorch.org/whl/nightly/cu126"],
+         "--index-url", "https://download.pytorch.org/whl/nightly/cu130"],
         capture_output=True, text=True, timeout=600)
     if r.returncode != 0:
         logger.error("Nightly update failed: %s", r.stderr[-500:])
         return False
-    logger.info("Updated to: %s", _get_torch_version(env_prefix))
+    new_version = _get_torch_version(env_prefix)
+    logger.info("Updated to: %s", new_version)
+    if new_version == old_version:
+        logger.info("No newer nightly available, marking as fresh")
+        _last_update_check[env_prefix] = datetime.now(timezone.utc)
     return True
 
 
@@ -319,6 +332,7 @@ def process_issue(issue_number: int) -> None:
 
 def auto_close_stale_repro_fails() -> None:
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=AUTO_CLOSE_AFTER_MINUTES)
+    grace_cutoff = datetime.now(timezone.utc) - timedelta(minutes=AUTO_CLOSE_GRACE_MINUTES)
 
     for issue in gh_fetch_issues(REPRO_FAIL_LABEL):
         num = issue["number"]
@@ -328,31 +342,57 @@ def auto_close_stale_repro_fails() -> None:
 
         comments = data.get("comments", [])
         bot_time = None
+        warning_time = None
+
         for c in reversed(comments):
             body = c.get("body", "")
-            if "Inductor Agent" in body and "Reproduction Failed" in body:
+            if warning_time is None and "Inductor Agent" in body and "Scheduled for Auto-close" in body:
+                try:
+                    warning_time = datetime.fromisoformat(c["createdAt"].replace("Z", "+00:00"))
+                except (KeyError, ValueError):
+                    pass
+            if bot_time is None and "Inductor Agent" in body and "Reproduction Failed" in body:
                 try:
                     bot_time = datetime.fromisoformat(c["createdAt"].replace("Z", "+00:00"))
                 except (KeyError, ValueError):
                     pass
+            if bot_time and warning_time:
                 break
 
         if not bot_time or bot_time > cutoff:
             continue
 
+        human_replied_after = bot_time
+        if warning_time and warning_time > bot_time:
+            human_replied_after = warning_time
+
         human_replied = any(
             "Inductor Agent" not in c.get("body", "")
-            and datetime.fromisoformat(c.get("createdAt", "2000-01-01T00:00:00Z").replace("Z", "+00:00")) > bot_time
+            and datetime.fromisoformat(c.get("createdAt", "2000-01-01T00:00:00Z").replace("Z", "+00:00")) > human_replied_after
             for c in comments
         )
         if human_replied:
             continue
 
-        logger.info("Auto-closing issue #%d", num)
+        if warning_time is None:
+            logger.info("Posting auto-close warning on issue #%d", num)
+            gh_post_comment(num, (
+                "🤖 **Inductor Agent — Scheduled for Auto-close**\n\n"
+                "This issue was marked as `NOT_REPRODUCED` and no response was received "
+                f"within {AUTO_CLOSE_AFTER_MINUTES} minutes.\n\n"
+                f"This issue will be **automatically closed in {AUTO_CLOSE_GRACE_MINUTES} minutes** "
+                "unless a human responds.\n\n"
+                "If this was closed in error, please reopen with additional reproduction details."
+            ))
+            continue
+
+        if warning_time > grace_cutoff:
+            continue
+
+        logger.info("Auto-closing issue #%d (grace period expired)", num)
         gh_post_comment(num, (
             "🤖 **Inductor Agent — Auto-closing**\n\n"
-            "This issue was marked as `NOT_REPRODUCED` and no response was received "
-            f"within {AUTO_CLOSE_AFTER_MINUTES} minutes.\n\n"
+            "The grace period has expired with no response. Closing this issue.\n\n"
             "If this was closed in error, please reopen with additional reproduction details."
         ))
         gh_close_issue(num)

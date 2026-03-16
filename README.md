@@ -92,7 +92,7 @@ All in `config.py`, overridable via env vars:
 |---|---|---|
 | `GITHUB_REPO` | `karthickai/test-inuductor-agent` | Repo to monitor |
 | `POLL_INTERVAL_SECONDS` | `120` | Loop poll interval |
-| `NIGHTLY_MAX_AGE_HOURS` | `24` | Auto-update nightly if older |
+| `NIGHTLY_MAX_AGE_HOURS` | `72` | Auto-update nightly if older |
 | `CLAUDE_TIMEOUT_SECONDS` | `2400` | Hard timeout for Claude |
 | `WORKDIR_CLEANUP_DAYS` | `7` | Auto-delete old workdirs |
 | `AUTO_CLOSE_AFTER_MINUTES` | `2880` | Auto-close NOT_REPRODUCED after 2 days |
