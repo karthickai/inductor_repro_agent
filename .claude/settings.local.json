@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(gh:*)",
+      "Bash(conda:*)",
+      "Bash(python:*)",
+      "Bash(pip:*)",
+      "Bash(cat:*)",
+      "Bash(mkdir:*)",
+      "Bash(source:*)"
+    ]
+  }
+}
