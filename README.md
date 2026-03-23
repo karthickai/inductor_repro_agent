@@ -23,12 +23,74 @@ A cron job polls GitHub for `inductor:agent` labeled issues, fetches the issue b
 
 | Classification | Meaning | Label | Action |
 |---|---|---|---|
-| `REPRODUCED` | All 3 runs fail with the reported error | `repro_success` | Tag code owners |
-| `FLAKY` | Some runs fail, some pass | `repro_success` | Tag code owners |
+| `REPRODUCED` | All 3 runs fail with the reported error | `repro_success` | Tag code owners, run bisection |
+| `FLAKY` | Some runs fail, some pass | `repro_success` | Tag code owners, run bisection |
 | `NOT_REPRODUCED` | All 3 runs pass | `repro_fail` | Auto-close after 2 days if no response |
-| `DIFFERENT_ERROR` | Fails with a different error | `repro_fail` | On-call investigates |
-| `ENV_ERROR` | Env broken or Claude failed | `repro_fail` | Check logs |
-| `TIMEOUT` | Claude exceeded time limit | `repro_fail` | Check logs |
+| `DIFFERENT_ERROR` | Fails with a different error | `repro_fail` | On-call investigates (**not** auto-closed) |
+| `ENV_ERROR` | Env broken or Claude failed | `repro_fail` | Check logs (**not** auto-closed) |
+| `TIMEOUT` | Claude exceeded time limit | `repro_fail` | Check logs (**not** auto-closed) |
+| `PREDEFINED_MITIGATION` | Standard mitigation applies (e.g. numerical tolerance) | `repro_fail` | Auto-close eligible |
+| `SYNTHESIZED_REPRO` | Repro synthesized from description (no code in issue) | `repro_success` | Tag code owners, note synthesized |
+
+## New features
+
+### 1. Repro synthesis (no clean code provided)
+
+When an issue doesn't contain a clean reproduction script, the agent attempts to **synthesize** one from descriptions, error messages, and code fragments mentioned in the issue. The synthesized script is tagged in the GitHub comment so reviewers know it was auto-generated.
+
+### 2. Nightly bisection
+
+When a bug is reproduced, the agent runs a **binary-search bisection** across older nightly builds to identify when the regression was introduced. Results include:
+
+- **Confidence level** (high/medium/low)
+- A table of tested nightly versions with pass/fail status
+- If the bug reproduces on ALL tested nightlies, it's flagged as a **long-standing issue** (not a recent regression)
+
+```
+Bisect: current nightly → FAIL
+Bisect: 2 days ago      → FAIL
+Bisect: 7 days ago      → PASS
+→ Regression window: 7 days ago → 2 days ago
+```
+
+### 3. Conservative auto-close
+
+Auto-close **only** applies to proper non-repro cases:
+- `NOT_REPRODUCED` — the bug doesn't reproduce
+- `PREDEFINED_MITIGATION` — standard mitigation confirmed
+
+The following are **never** auto-closed (they may indicate infra issues):
+- `DIFFERENT_ERROR`
+- `ENV_ERROR`
+- `TIMEOUT`
+
+### 4. Broader dependency sets (external libraries)
+
+The agent detects when an issue requires third-party external libraries and installs them automatically:
+
+| Library Group | Packages |
+|---|---|
+| **transformers** | transformers, accelerate, datasets |
+| **diffusers** | diffusers, transformers, accelerate |
+| **timm** | timm |
+| **huggingface_hub** | huggingface_hub, safetensors |
+| **sentence_transformers** | sentence-transformers |
+| **lightning** | lightning, pytorch-lightning |
+
+Detection is based on import markers in the issue body and repro script.
+
+### 5. Predefined scripts for common categories
+
+For common issue types, the agent runs **predefined diagnostic scripts** that can determine if the issue is expected behavior:
+
+| Category | Detection Keywords | Auto-close? |
+|---|---|---|
+| **Numerical tolerance** | allclose, atol, rtol, accuracy, mismatch | ✅ Yes (if diff < 1e-6) |
+| **Precision cast** | float16, bfloat16, mixed precision, autocast | ✅ Yes (if diff < 1e-6) |
+| **Dynamic shapes** | guard, symbolic, SymInt, data-dependent | ❌ No (guidance only) |
+| **Graph break** | graph break, Unsupported:, skipping | ❌ No (guidance only) |
+
+Example: A user reports "torch.compile gives slightly different output" with max_diff=5.96e-08. The predefined numerical tolerance check confirms this is within expected floating-point reordering range and the issue is eligible for auto-close with an explanation.
 
 
 ## Code owner tagging
@@ -96,7 +158,16 @@ All in `config.py`, overridable via env vars:
 | `CLAUDE_TIMEOUT_SECONDS` | `2400` | Hard timeout for Claude |
 | `WORKDIR_CLEANUP_DAYS` | `7` | Auto-delete old workdirs |
 | `AUTO_CLOSE_AFTER_MINUTES` | `2880` | Auto-close NOT_REPRODUCED after 2 days |
+| `AUTO_CLOSE_GRACE_MINUTES` | `1440` | Grace period before actual close |
 | `GH_RETRY_ATTEMPTS` | `3` | Retry count for gh calls |
+| `BISECT_ENABLED` | `1` | Enable nightly bisection |
+| `BISECT_MAX_VERSIONS` | `7` | Max nightly versions to test during bisect |
+| `BISECT_LOOKBACK_DAYS` | `14` | How far back to look for nightlies |
+| `BISECT_TIMEOUT_SECONDS` | `300` | Timeout per bisect repro run |
+| `EXTERNAL_INSTALL_TIMEOUT` | `300` | Timeout for external dep install |
+| `NUMERICAL_ATOL_THRESHOLD` | `1e-6` | Atol for numerical tolerance checks |
+| `NUMERICAL_RTOL_THRESHOLD` | `1e-6` | Rtol for numerical tolerance checks |
+| `PRECISION_AUTO_CLOSE_MAX_DIFF` | `1e-6` | Max diff for precision auto-close |
 
 ## Project structure
 
@@ -105,6 +176,9 @@ inductor-agent/
 ├── main.py                 # Cron: poll → fetch → Claude → label → comment
 ├── config.py               # All configuration
 ├── codeowners.py           # Area-to-owner mapping (Claude reads this)
+├── nightly_bisect.py       # Bisect across nightly builds to find regressions
+├── external_deps.py        # Detect & install external libraries (HF, timm, etc.)
+├── predefined_scripts.py   # Predefined diagnostic scripts for common categories
 ├── .claude/
 │   ├── settings.local.json # Claude Code tool permissions
 │   └── skills/
@@ -112,11 +186,42 @@ inductor-agent/
 │           └── SKILL.md    # Claude skill: read issue → repro → result.json
 ├── workdir/
 │   └── {issue_number}/
-│       ├── issue.json          # Written by main.py
-│       ├── repro.py            # Written by Claude
-│       ├── result.json         # Written by Claude
-│       └── claude_output.log   # Claude's full output
+│       ├── issue.json             # Written by main.py
+│       ├── repro.py               # Written by Claude
+│       ├── predefined_check.py    # Written by predefined_scripts.py (if applicable)
+│       ├── result.json            # Written by Claude, enriched by main.py
+│       └── claude_output.log      # Claude's full output
 ├── logs/
 │   └── main.log
 └── README.md
+```
+
+## Issue processing flow
+
+```
+Issue arrives with inductor:agent label
+    │
+    ├── Has clean repro code?
+    │   ├── Yes → Standard repro path
+    │   └── No  → Synthesize repro from description
+    │
+    ├── Needs external libraries?
+    │   └── Yes → Install (transformers, timm, etc.)
+    │
+    ├── Invoke Claude → writes repro.py, runs 3x, writes result.json
+    │
+    ├── Matches predefined category?
+    │   └── Yes → Run predefined diagnostic script
+    │       └── Mitigation applies? → PREDEFINED_MITIGATION (auto-close eligible)
+    │
+    ├── Bug reproduced?
+    │   └── Yes → Run nightly bisection
+    │       └── Find regression window or confirm long-standing
+    │
+    └── Post comment with all results
+        ├── Repro result + script
+        ├── Bisection table (if ran)
+        ├── External deps status (if any)
+        ├── Predefined check results (if any)
+        └── Environment info + code owner tags
 ```

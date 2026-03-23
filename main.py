@@ -12,6 +12,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -21,7 +22,9 @@ from datetime import datetime, timedelta, timezone
 from codeowners import format_owner_tags
 from config import (
     AUTO_CLOSE_AFTER_MINUTES,
+    AUTO_CLOSE_CLASSIFICATIONS,
     AUTO_CLOSE_GRACE_MINUTES,
+    BISECT_ENABLED,
     CLAUDE_TIMEOUT_SECONDS,
     GH_RETRY_ATTEMPTS,
     GITHUB_REPO,
@@ -38,6 +41,12 @@ from config import (
     WORK_DIR,
     WORKDIR_CLEANUP_DAYS,
 )
+from nightly_bisect import bisect_nightly, format_bisect_comment
+from external_deps import ensure_external_deps, format_external_deps_comment
+from predefined_scripts import (
+    check_predefined_mitigations,
+    format_predefined_comment,
+)
 
 SKIP_LABELS = {PROCESSING_LABEL, REPRO_SUCCESS_LABEL, REPRO_FAIL_LABEL}
 
@@ -51,6 +60,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _error_result(reason: str) -> dict:
     return {"classification": "ENV_ERROR", "reason": reason,
@@ -70,6 +83,10 @@ def _gh(args: list[str], timeout: int = 30) -> subprocess.CompletedProcess:
             time.sleep(2)
     return subprocess.CompletedProcess(args=args, returncode=1, stdout="", stderr="retries exhausted")
 
+
+# ---------------------------------------------------------------------------
+# GitHub API wrappers
+# ---------------------------------------------------------------------------
 
 def gh_fetch_issues(label: str) -> list[dict]:
     r = _gh(["gh", "issue", "list", "--repo", GITHUB_REPO, "--label", label,
@@ -119,6 +136,10 @@ def should_skip(issue_number: int) -> bool:
         return True
     return False
 
+
+# ---------------------------------------------------------------------------
+# Nightly environment management
+# ---------------------------------------------------------------------------
 
 _last_update_check: dict[str, datetime] = {}
 
@@ -211,7 +232,43 @@ def ensure_nightly_env() -> bool:
     return True
 
 
-def invoke_claude(issue_number: int, issue_dir: str) -> None:
+# ---------------------------------------------------------------------------
+# Issue text analysis helpers
+# ---------------------------------------------------------------------------
+
+_CODE_BLOCK_RE = re.compile(r"```(?:python|py)?\s*\n(.+?)```", re.DOTALL)
+
+
+def _extract_code_blocks(text: str) -> list[str]:
+    """Extract Python code blocks from markdown text."""
+    return _CODE_BLOCK_RE.findall(text)
+
+
+def _has_clean_repro(issue_data: dict) -> bool:
+    """Check if the issue has an explicit code block that looks like a repro."""
+    body = issue_data.get("body", "")
+    comments = issue_data.get("comments", [])
+    all_text = body + "\n".join(c.get("body", "") for c in comments)
+    blocks = _extract_code_blocks(all_text)
+    for block in blocks:
+        if "import torch" in block or "torch.compile" in block or "torch._inductor" in block:
+            return True
+    return False
+
+
+def _get_full_issue_text(issue_data: dict) -> str:
+    """Combine body and all comment bodies into a single string."""
+    body = issue_data.get("body", "")
+    comments = issue_data.get("comments", [])
+    parts = [body] + [c.get("body", "") for c in comments]
+    return "\n\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Claude invocation
+# ---------------------------------------------------------------------------
+
+def invoke_claude(issue_number: int, issue_dir: str, synthesize_repro: bool = False) -> None:
     skill_path = os.path.join(PROJECT_DIR, ".claude", "skills", "inductor-repro", "SKILL.md")
     issue_file = os.path.join(issue_dir, "issue.json")
     log_file = os.path.join(issue_dir, "claude_output.log")
@@ -220,12 +277,24 @@ def invoke_claude(issue_number: int, issue_dir: str) -> None:
               f"step by step to reproduce GitHub issue #{issue_number}. "
               f"The issue data is at {issue_file}.")
 
-    logger.info("Invoking Claude for issue #%d", issue_number)
+    if synthesize_repro:
+        prompt += (
+            "\n\nIMPORTANT: This issue does NOT contain a clean reproduction script. "
+            "You MUST attempt to synthesize a repro script from the description, "
+            "error messages, and any code snippets mentioned in the issue. "
+            "Follow the 'Synthesizing a repro' section in the skill file."
+        )
+
+    logger.info("Invoking Claude for issue #%d (synthesize=%s)", issue_number, synthesize_repro)
     with open(log_file, "w") as f:
         subprocess.run(["claude", "--print", "--dangerously-skip-permissions", prompt],
                        cwd=PROJECT_DIR, stdout=f, stderr=subprocess.STDOUT, timeout=CLAUDE_TIMEOUT_SECONDS)
     logger.info("Claude finished for issue #%d", issue_number)
 
+
+# ---------------------------------------------------------------------------
+# Result validation & comment building
+# ---------------------------------------------------------------------------
 
 def validate_result(raw: dict) -> dict:
     for key in ("classification", "reason", "runs_failed", "runs_total", "error_output", "repro_script"):
@@ -242,21 +311,49 @@ def validate_result(raw: dict) -> dict:
     return raw
 
 
-def build_comment(result: dict, owner_tags: str = "") -> str:
+def build_comment(
+    result: dict,
+    owner_tags: str = "",
+    bisect_section: str = "",
+    partner_section: str = "",
+    predefined_section: str = "",
+) -> str:
     classification = result["classification"]
     runs = f"{result['runs_failed']}/{result['runs_total']} failed"
     error_output = result["error_output"][:3000]
     repro_script = result["repro_script"]
+    synthesized = result.get("synthesized_repro", False)
 
     if classification in ("REPRODUCED", "FLAKY"):
         emoji = "✅" if classification == "REPRODUCED" else "🔄"
+        synth_note = " *(repro synthesized from description)*" if synthesized else ""
         comment = (
-            f"🤖 **Inductor Agent — Reproduction Successful**\n\n"
+            f"🤖 **Inductor Agent — Reproduction Successful**{synth_note}\n\n"
             f"| Field | Value |\n|-------|-------|\n"
             f"| **Result** | {emoji} {classification} |\n"
             f"| **Runs** | {runs} |\n\n"
             f"<details>\n<summary>Error output (last run)</summary>\n\n```\n{error_output}\n```\n</details>\n\n"
             f"<details>\n<summary>Reproduction script</summary>\n\n```python\n{repro_script}\n```\n</details>"
+        )
+    elif classification == "PREDEFINED_MITIGATION":
+        comment = (
+            f"🤖 **Inductor Agent — Predefined Mitigation Applied**\n\n"
+            f"| Field | Value |\n|-------|-------|\n"
+            f"| **Result** | 📋 {classification} |\n"
+            f"| **Reason** | {result['reason']} |\n"
+            f"| **Runs** | {runs} |\n"
+        )
+    elif classification == "SYNTHESIZED_REPRO":
+        comment = (
+            f"🤖 **Inductor Agent — Synthesized Reproduction Attempt**\n\n"
+            f"| Field | Value |\n|-------|-------|\n"
+            f"| **Result** | 🔧 {classification} |\n"
+            f"| **Reason** | {result['reason']} |\n"
+            f"| **Runs** | {runs} |\n\n"
+            f"*No clean reproduction script was provided in the issue. "
+            f"The agent attempted to synthesize one from the description.*\n\n"
+            f"<details>\n<summary>Synthesized script</summary>\n\n```python\n{repro_script}\n```\n</details>\n\n"
+            f"<details>\n<summary>Output</summary>\n\n```\n{error_output}\n```\n</details>"
         )
     else:
         comment = (
@@ -268,12 +365,21 @@ def build_comment(result: dict, owner_tags: str = "") -> str:
             f"<details>\n<summary>Output</summary>\n\n```\n{error_output}\n```\n</details>"
         )
 
+    # Append extra sections
+    for section in (bisect_section, partner_section, predefined_section):
+        if section:
+            comment += f"\n\n{section}"
+
     if collect_env_cache:
         comment += f"\n\n<details>\n<summary>Environment</summary>\n\n```\n{collect_env_cache}\n```\n</details>"
     if owner_tags:
         comment += f"\n\n{owner_tags}"
     return comment
 
+
+# ---------------------------------------------------------------------------
+# Core issue processing
+# ---------------------------------------------------------------------------
 
 def process_issue(issue_number: int) -> None:
     if should_skip(issue_number):
@@ -293,14 +399,34 @@ def process_issue(issue_number: int) -> None:
         return
 
     result = None
+    bisect_section = ""
+    partner_section = ""
+    predefined_section = ""
+
     try:
         issue_dir = os.path.join(WORK_DIR, str(issue_number))
         os.makedirs(issue_dir, exist_ok=True)
         with open(os.path.join(issue_dir, "issue.json"), "w") as f:
             json.dump(issue_data, f, indent=2)
 
+        full_text = _get_full_issue_text(issue_data)
+        has_repro = _has_clean_repro(issue_data)
+        synthesize = not has_repro
+
+        if synthesize:
+            logger.info("Issue #%d: no clean repro found, will attempt synthesis", issue_number)
+
+        # --- External dependencies ---
+        external_results = ensure_external_deps(full_text)
+        if external_results:
+            partner_section = format_external_deps_comment(external_results)
+            failed_deps = [g for g, ok in external_results.items() if not ok]
+            if failed_deps:
+                logger.warning("Issue #%d: some external deps failed: %s", issue_number, failed_deps)
+
+        # --- Invoke Claude ---
         try:
-            invoke_claude(issue_number, issue_dir)
+            invoke_claude(issue_number, issue_dir, synthesize_repro=synthesize)
         except subprocess.TimeoutExpired:
             logger.error("Claude timed out for issue #%d", issue_number)
             result = _error_result(f"Claude exceeded {CLAUDE_TIMEOUT_SECONDS}s limit.")
@@ -319,18 +445,80 @@ def process_issue(issue_number: int) -> None:
         if result is None:
             result = _error_result("Claude did not produce result.json.")
 
+        # Tag synthesized repros
+        if synthesize and result["classification"] in ("REPRODUCED", "FLAKY"):
+            result["synthesized_repro"] = True
+
+        # --- Predefined mitigation checks ---
+        repro_script = result.get("repro_script", "")
+        predefined_result = check_predefined_mitigations(full_text, repro_script, issue_dir)
+        if predefined_result and predefined_result.mitigation_applies:
+            predefined_section = format_predefined_comment(predefined_result)
+            if predefined_result.auto_close_eligible:
+                result["classification"] = "PREDEFINED_MITIGATION"
+                result["reason"] = (
+                    f"Predefined mitigation for '{predefined_result.matched_category}' "
+                    f"confirmed this is expected behavior."
+                )
+                logger.info("Issue #%d: predefined mitigation applies (%s)",
+                            issue_number, predefined_result.matched_category)
+        elif predefined_result:
+            predefined_section = format_predefined_comment(predefined_result)
+
+        # --- Nightly bisection ---
+        repro_path = os.path.join(issue_dir, "repro.py")
+        if (BISECT_ENABLED
+                and result["classification"] in ("REPRODUCED", "FLAKY")
+                and os.path.exists(repro_path)):
+            logger.info("Issue #%d: running nightly bisection", issue_number)
+            bisect_result = bisect_nightly(repro_path)
+            if bisect_result.ran:
+                bisect_section = format_bisect_comment(bisect_result)
+                result["bisect_confidence"] = bisect_result.confidence
+                result["bisect_summary"] = bisect_result.summary
+
     finally:
         if result is None:
             result = _error_result("Pipeline crashed.")
 
-        final_label = REPRO_SUCCESS_LABEL if result["classification"] in ("REPRODUCED", "FLAKY") else REPRO_FAIL_LABEL
+        final_label = (
+            REPRO_SUCCESS_LABEL
+            if result["classification"] in ("REPRODUCED", "FLAKY", "SYNTHESIZED_REPRO")
+            else REPRO_FAIL_LABEL
+        )
         gh_swap_label(issue_number, PROCESSING_LABEL, final_label)
         owner_tags = format_owner_tags(result.get("matched_areas", []))
-        gh_post_comment(issue_number, build_comment(result, owner_tags))
+        comment = build_comment(
+            result,
+            owner_tags=owner_tags,
+            bisect_section=bisect_section,
+            partner_section=partner_section,
+            predefined_section=predefined_section,
+        )
+        gh_post_comment(issue_number, comment)
+
+        # Save enriched result
+        enriched_result_path = os.path.join(WORK_DIR, str(issue_number), "result.json")
+        try:
+            with open(enriched_result_path, "w") as f:
+                json.dump(result, f, indent=2)
+        except OSError:
+            pass
+
         logger.info("Issue #%d: %s → %s", issue_number, result["classification"], final_label)
 
 
+# ---------------------------------------------------------------------------
+# Conservative auto-close
+# ---------------------------------------------------------------------------
+
 def auto_close_stale_repro_fails() -> None:
+    """Auto-close only issues whose classification is in AUTO_CLOSE_CLASSIFICATIONS.
+
+    This is more conservative than the previous approach: we skip
+    DIFFERENT_ERROR, ENV_ERROR, and TIMEOUT since those may indicate
+    infrastructure problems rather than invalid issues.
+    """
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=AUTO_CLOSE_AFTER_MINUTES)
     grace_cutoff = datetime.now(timezone.utc) - timedelta(minutes=AUTO_CLOSE_GRACE_MINUTES)
 
@@ -341,6 +529,16 @@ def auto_close_stale_repro_fails() -> None:
             continue
 
         comments = data.get("comments", [])
+
+        # --- Conservative check: only auto-close proper non-repro cases ---
+        classification = _extract_classification_from_comments(comments)
+        if classification and classification not in AUTO_CLOSE_CLASSIFICATIONS:
+            logger.info(
+                "Issue #%d: classification=%s not eligible for auto-close, skipping",
+                num, classification,
+            )
+            continue
+
         bot_time = None
         warning_time = None
 
@@ -358,6 +556,17 @@ def auto_close_stale_repro_fails() -> None:
                     pass
             if bot_time and warning_time:
                 break
+
+        # Also check for predefined mitigation auto-close
+        if bot_time is None:
+            for c in reversed(comments):
+                body = c.get("body", "")
+                if "Inductor Agent" in body and "Predefined Mitigation Applied" in body:
+                    try:
+                        bot_time = datetime.fromisoformat(c["createdAt"].replace("Z", "+00:00"))
+                    except (KeyError, ValueError):
+                        pass
+                    break
 
         if not bot_time or bot_time > cutoff:
             continue
@@ -398,6 +607,22 @@ def auto_close_stale_repro_fails() -> None:
         gh_close_issue(num)
 
 
+def _extract_classification_from_comments(comments: list[dict]) -> str | None:
+    """Extract the classification from the bot's result comment."""
+    for c in reversed(comments):
+        body = c.get("body", "")
+        if "Inductor Agent" not in body:
+            continue
+        match = re.search(r"\*\*Result\*\*\s*\|\s*[^\|]*?\s+([\w_]+)\s*\|", body)
+        if match:
+            return match.group(1)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Maintenance
+# ---------------------------------------------------------------------------
+
 def cleanup_old_workdirs() -> None:
     if not os.path.exists(WORK_DIR):
         return
@@ -408,6 +633,10 @@ def cleanup_old_workdirs() -> None:
             shutil.rmtree(path)
             logger.info("Cleaned up workdir: %s", entry)
 
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
 
 def poll_once() -> int:
     if not ensure_nightly_env():
