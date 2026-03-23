@@ -11,7 +11,6 @@ diffusers, etc.).  This module:
 
 import logging
 import os
-import re
 import subprocess
 
 from config import NIGHTLY_ENV, EXTERNAL_DEPS, EXTERNAL_INSTALL_TIMEOUT

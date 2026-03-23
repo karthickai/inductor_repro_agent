@@ -74,13 +74,3 @@ EXTERNAL_DEPS = {
 
 # Max time to spend installing external deps
 EXTERNAL_INSTALL_TIMEOUT = int(os.environ.get("EXTERNAL_INSTALL_TIMEOUT", "300"))
-
-# ---------------------------------------------------------------------------
-# Predefined scripts / common issue categories
-# ---------------------------------------------------------------------------
-# Numerical tolerance thresholds for auto-close decisions
-NUMERICAL_ATOL_THRESHOLD = float(os.environ.get("NUMERICAL_ATOL_THRESHOLD", "1e-6"))
-NUMERICAL_RTOL_THRESHOLD = float(os.environ.get("NUMERICAL_RTOL_THRESHOLD", "1e-6"))
-
-# Max acceptable diff for predefined precision mitigation auto-close
-PRECISION_AUTO_CLOSE_MAX_DIFF = float(os.environ.get("PRECISION_AUTO_CLOSE_MAX_DIFF", "1e-6"))

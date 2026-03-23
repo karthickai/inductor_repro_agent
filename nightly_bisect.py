@@ -55,18 +55,51 @@ def _get_env_prefix() -> str | None:
     return None
 
 
+def _find_nightly_version_for_date(env_prefix: str, date_str: str) -> str | None:
+    """Query pip for the nightly torch version matching a specific date.
+
+    Returns a version string like ``2.7.0.dev20260320`` or None.
+    """
+    if date_str == "latest":
+        return None
+    pip = os.path.join(env_prefix, "bin", "pip")
+    r = subprocess.run(
+        [pip, "index", "versions", "torch", "--pre", "--index-url", NIGHTLY_INDEX_URL],
+        capture_output=True, text=True, timeout=120,
+    )
+    if r.returncode != 0:
+        return None
+    for line in r.stdout.splitlines():
+        if date_str in line:
+            for token in line.replace(",", " ").replace("(", " ").replace(")", " ").split():
+                if date_str in token and "dev" in token:
+                    return token.strip()
+    return None
+
+
 def _install_nightly_for_date(env_prefix: str, date_str: str) -> bool:
     """Install a specific nightly build by date (YYYYMMDD).
 
-    PyTorch nightlies are published daily — we pin by requesting the exact
-    version string ``X.Y.Z.devYYYYMMDD``.  If the exact version isn't
-    available pip will just fail, which we handle gracefully.
+    PyTorch nightlies are published daily.  We look up the version matching
+    ``date_str`` via ``pip index versions`` and pin it explicitly.  For
+    ``"latest"`` we install without pinning.
     """
     pip = os.path.join(env_prefix, "bin", "pip")
     logger.info("Bisect: installing nightly for date %s", date_str)
+
+    torch_pkg = "torch"
+    if date_str != "latest":
+        pinned_version = _find_nightly_version_for_date(env_prefix, date_str)
+        if pinned_version:
+            torch_pkg = f"torch=={pinned_version}"
+            logger.info("Bisect: pinning to %s", pinned_version)
+        else:
+            logger.warning("Bisect: could not find nightly version for %s", date_str)
+            return False
+
     r = subprocess.run(
         [pip, "install", "--pre", "--force-reinstall",
-         "torch", "torchvision", "torchaudio",
+         torch_pkg, "torchvision", "torchaudio",
          "--index-url", NIGHTLY_INDEX_URL],
         capture_output=True, text=True, timeout=600,
         env={**os.environ, "PIP_NO_CACHE_DIR": "1"},

@@ -1,6 +1,6 @@
 ---
 name: inductor-repro
-description: Reproduce a PyTorch Inductor GitHub issue. Reads issue data from a local file, runs a repro script in the pytorch-nightly conda env, and writes a result.json file. Handles issues with no clean repro by synthesizing scripts from descriptions.
+description: Reproduce a PyTorch Inductor GitHub issue. Reads issue data from a local file, writes and runs a repro script in the pytorch-nightly conda env, detects common issue categories, and writes a result.json file.
 ---
 
 # Reproduce a PyTorch Inductor Issue
@@ -18,7 +18,7 @@ Replace `{N}` with the actual issue number in all commands.
 
 ## Steps
 
-### 1. Read the issue
+### 1. Read the issue and detect category
 
 Read `issue.json`. Look at both `body` and `comments` for:
 - Code snippets (in ``` code blocks)
@@ -31,6 +31,79 @@ Read `issue.json`. Look at both `body` and `comments` for:
 - **Has code fragments but incomplete** → proceed to Step 2a (synthesize repro)
 - **Has only descriptions / error messages, no code** → proceed to Step 2a (synthesize repro)
 
+**Detect predefined categories** by scanning the issue text for keywords.
+If 2 or more keywords from any category below match, that category applies.
+Multiple categories can apply; prioritize the one with the most keyword matches.
+
+---
+
+#### Category: `numerical_tolerance`
+
+**Keywords:** allclose, atol, rtol, numerical, tolerance, accuracy, mismatch,
+max diff, precision, incorrect output, wrong result
+
+**What to do:** In your repro script, you MUST:
+1. Compare eager vs compiled output with `torch.allclose()`
+2. Test at multiple tolerances: `atol` in `[1e-4, 1e-5, 1e-6, 1e-7, 1e-8]`
+3. Test across dtypes: `float32`, `float16`, `bfloat16`
+4. Print the max diff and pass/fail at each tolerance
+5. If ALL diffs are < **1e-6**, classify as `PREDEFINED_MITIGATION`
+   with `predefined_category = "numerical_tolerance"`
+
+**Auto-close eligible:** Yes
+
+---
+
+#### Category: `precision_cast`
+
+**Keywords:** float16, fp16, bfloat16, bf16, half precision, mixed precision,
+autocast, amp, precision loss, cast, dtype mismatch
+
+**What to do:** In your repro script, you MUST:
+1. Test the operation in `float32`, `float16`, and `bfloat16`
+2. Compare eager vs compiled at each dtype
+3. Also test precision-cast roundtrip: cast `fp32→low→fp32` in eager,
+   compare against straight `fp32` eager to show inherent precision loss
+4. Compare the compile diff against the cast-roundtrip diff
+5. If compile diff is < **1e-6**, classify as `PREDEFINED_MITIGATION`
+   with `predefined_category = "precision_cast"`
+
+**Auto-close eligible:** Yes
+
+---
+
+#### Category: `dynamic_shapes_guard`
+
+**Keywords:** guard, dynamic shape, symbolic, Unsupported: dynamic, SymInt,
+data-dependent, GuardOnDataDependentSymNode
+
+**What to do:** In your repro script, you MUST:
+1. Test with both static and dynamic inputs
+2. Try `torch._dynamo.mark_dynamic()` on varying dimensions
+3. Check if the error changes with
+   `torch._dynamo.config.capture_scalar_outputs = True`
+4. Report which workarounds help (if any) in the result reason
+5. Do NOT classify as `PREDEFINED_MITIGATION` — classify normally
+
+**Auto-close eligible:** No
+
+---
+
+#### Category: `graph_break`
+
+**Keywords:** graph break, graph_break, Unsupported:, skipping,
+torch._dynamo.exc.Unsupported
+
+**What to do:** In your repro script, you MUST:
+1. Add `torch._dynamo.explain()` output
+2. Try compiling with `fullgraph=False` and `fullgraph=True`
+3. Report the graph break reason in the result
+4. Do NOT classify as `PREDEFINED_MITIGATION` — classify normally
+
+**Auto-close eligible:** No
+
+---
+
 ### 2. Write the repro script (standard path)
 
 ```bash
@@ -41,6 +114,8 @@ Write `workdir/{N}/repro.py`:
 - Complete, self-contained, all imports included
 - Use the exact code from the issue
 - Do NOT download model weights or datasets
+- If a predefined category was detected, include the extra checks
+  described in that category's "What to do" section
 
 Proceed to Step 3.
 
@@ -56,13 +131,7 @@ create one from the available information:
    - Any specific `torch.compile` options mentioned? (backend, mode, fullgraph)
    - Any error class mentioned? (RuntimeError, AssertionError, etc.)
 
-2. **Check for common issue categories** (see Step 2b):
-   - Numerical accuracy / tolerance issues
-   - Precision / dtype issues
-   - Dynamic shapes issues
-   - Graph break issues
-
-3. **Build a minimal repro** using this template:
+2. **Build a minimal repro** using this template:
 ```python
 import torch
 
@@ -93,52 +162,9 @@ if isinstance(eager_out, torch.Tensor):
     print("PASSED")
 ```
 
+3. If a predefined category was detected, include those extra checks too
 4. Write the synthesized script to `workdir/{N}/repro.py`
 5. Proceed to Step 3
-
-### 2b. Predefined checks for common categories
-
-If the issue matches one of these categories, run the appropriate predefined
-check IN ADDITION to the standard repro:
-
-#### Numerical / Tolerance Issues
-**Triggers:** "allclose", "atol", "rtol", "numerical", "tolerance", "accuracy",
-"mismatch", "max diff", "precision", "incorrect output", "wrong result"
-
-**Action:** Test with multiple tolerance levels and precision modes:
-```python
-# Test at various tolerances
-for atol in [1e-4, 1e-5, 1e-6, 1e-7, 1e-8]:
-    close = torch.allclose(eager_out, compiled_out, atol=atol, rtol=1e-6)
-    print(f"atol={atol}: {'PASS' if close else 'FAIL'}")
-```
-
-If the difference is very small (< 1e-6), note in the result that this may be
-expected floating-point reordering behavior.
-
-#### Precision Cast / Mixed Precision Issues
-**Triggers:** "float16", "fp16", "bfloat16", "bf16", "mixed precision",
-"autocast", "amp", "half"
-
-**Action:** Test the operation in multiple dtypes and compare:
-```python
-for dtype in [torch.float32, torch.float16, torch.bfloat16]:
-    x = torch.randn(shape, device=device, dtype=dtype)
-    eager = fn(x)
-    compiled = torch.compile(fn)(x)
-    diff = (eager.float() - compiled.float()).abs().max().item()
-    print(f"{dtype}: max_diff={diff}")
-```
-
-If all differences are < 1e-3, this is likely expected precision behavior.
-
-#### External Library Issues
-**Triggers:** imports from `transformers`, `diffusers`, `timm`
-
-**Action:** Note in `result.json` which external libraries are required. The
-orchestrator (main.py) will handle installing them. If an external library is
-not available and causes an ImportError, classify as `ENV_ERROR` with reason
-noting the missing dependency.
 
 ### 3. Run 3 times
 
@@ -155,7 +181,7 @@ Classify:
 | `NOT_REPRODUCED` | All 3 pass |
 | `DIFFERENT_ERROR` | Fails with a different error |
 | `ENV_ERROR` | Env is broken (missing package, etc.) |
-| `PREDEFINED_MITIGATION` | Standard mitigation applies (small numerical diff, expected precision) |
+| `PREDEFINED_MITIGATION` | Standard mitigation applies (see category rules above) |
 | `SYNTHESIZED_REPRO` | Repro was synthesized and may not exactly match the reported issue |
 
 If `DIFFERENT_ERROR` is fixable (missing import/package), fix and re-run (up to 3 attempts).
@@ -186,15 +212,21 @@ Write `workdir/{N}/result.json`:
   "repro_script": "contents of repro.py",
   "matched_areas": ["Dynamic Shapes", "Lowering"],
   "synthesized_repro": false,
-  "partner_deps_needed": [],
+  "external_deps_needed": [],
   "predefined_category": ""
 }
 ```
 
-**Extra fields:**
+**Fields:**
+- `classification` (str): one of the classification values above
+- `reason` (str): human-readable explanation
+- `runs_failed` / `runs_total` (int): run counts
+- `error_output` (str): stderr/stdout from last run (up to 3000 chars)
+- `repro_script` (str): full contents of the repro script
+- `matched_areas` (list[str]): areas from codeowners.py
 - `synthesized_repro` (bool): true if you created the repro from descriptions
-- `partner_deps_needed` (list[str]): e.g. `["transformers", "timm"]` — external libraries required
-- `predefined_category` (str): e.g. `"numerical_tolerance"`, `"precision_cast"`
+- `external_deps_needed` (list[str]): e.g. `["transformers", "timm"]`
+- `predefined_category` (str): e.g. `"numerical_tolerance"`, `"precision_cast"`, `""` if none
 
 **This file is mandatory.** Always write it, even on failure.
 
@@ -202,13 +234,13 @@ Write `workdir/{N}/result.json`:
 
 ```
 === INDUCTOR AGENT RESULT ===
-Issue:        #{N}
-Result:       {classification}
-Runs:         {runs_failed}/{runs_total} failed
-Env:          pytorch-nightly
-Synthesized:  {yes/no}
+Issue:         #{N}
+Result:        {classification}
+Runs:          {runs_failed}/{runs_total} failed
+Env:           pytorch-nightly
+Synthesized:   {yes/no}
+Category:      {predefined_category or none}
 External deps: {list or none}
-Predefined:   {category or none}
 ===========================
 ```
 
@@ -219,3 +251,4 @@ Predefined:   {category or none}
 - **Never modify the pytorch source tree.**
 - **Always write result.json.**
 - **Always attempt a repro** — even if there's no clean code, try to synthesize one.
+- **Always check for predefined categories** — scan the issue text for keywords and follow the category instructions.

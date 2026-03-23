@@ -79,9 +79,12 @@ The agent detects when an issue requires third-party external libraries and inst
 
 Detection is based on import markers in the issue body and repro script.
 
-### 5. Predefined scripts for common categories
+### 5. Predefined checks for common categories
 
-For common issue types, the agent runs **predefined diagnostic scripts** that can determine if the issue is expected behavior:
+Claude detects common issue categories by scanning keywords in the issue text
+and generates the appropriate diagnostic scripts itself (via SKILL.md instructions).
+No separate Python module is needed — Claude handles detection, script creation,
+and execution end-to-end:
 
 | Category | Detection Keywords | Auto-close? |
 |---|---|---|
@@ -165,9 +168,6 @@ All in `config.py`, overridable via env vars:
 | `BISECT_LOOKBACK_DAYS` | `14` | How far back to look for nightlies |
 | `BISECT_TIMEOUT_SECONDS` | `300` | Timeout per bisect repro run |
 | `EXTERNAL_INSTALL_TIMEOUT` | `300` | Timeout for external dep install |
-| `NUMERICAL_ATOL_THRESHOLD` | `1e-6` | Atol for numerical tolerance checks |
-| `NUMERICAL_RTOL_THRESHOLD` | `1e-6` | Rtol for numerical tolerance checks |
-| `PRECISION_AUTO_CLOSE_MAX_DIFF` | `1e-6` | Max diff for precision auto-close |
 
 ## Project structure
 
@@ -178,7 +178,6 @@ inductor-agent/
 ├── codeowners.py           # Area-to-owner mapping (Claude reads this)
 ├── nightly_bisect.py       # Bisect across nightly builds to find regressions
 ├── external_deps.py        # Detect & install external libraries (HF, timm, etc.)
-├── predefined_scripts.py   # Predefined diagnostic scripts for common categories
 ├── .claude/
 │   ├── settings.local.json # Claude Code tool permissions
 │   └── skills/
@@ -187,8 +186,7 @@ inductor-agent/
 ├── workdir/
 │   └── {issue_number}/
 │       ├── issue.json             # Written by main.py
-│       ├── repro.py               # Written by Claude
-│       ├── predefined_check.py    # Written by predefined_scripts.py (if applicable)
+│       ├── repro.py               # Written by Claude (includes predefined checks if applicable)
 │       ├── result.json            # Written by Claude, enriched by main.py
 │       └── claude_output.log      # Claude's full output
 ├── logs/
@@ -208,11 +206,11 @@ Issue arrives with inductor:agent label
     ├── Needs external libraries?
     │   └── Yes → Install (transformers, timm, etc.)
     │
-    ├── Invoke Claude → writes repro.py, runs 3x, writes result.json
-    │
-    ├── Matches predefined category?
-    │   └── Yes → Run predefined diagnostic script
-    │       └── Mitigation applies? → PREDEFINED_MITIGATION (auto-close eligible)
+    ├── Invoke Claude:
+    │   ├── Detects predefined categories (numerical, precision, etc.)
+    │   ├── Writes repro.py (with predefined checks baked in)
+    │   ├── Runs 3x, classifies result
+    │   └── Writes result.json (PREDEFINED_MITIGATION if standard mitigation applies)
     │
     ├── Bug reproduced?
     │   └── Yes → Run nightly bisection
@@ -222,6 +220,5 @@ Issue arrives with inductor:agent label
         ├── Repro result + script
         ├── Bisection table (if ran)
         ├── External deps status (if any)
-        ├── Predefined check results (if any)
         └── Environment info + code owner tags
 ```

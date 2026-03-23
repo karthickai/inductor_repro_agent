@@ -43,10 +43,6 @@ from config import (
 )
 from nightly_bisect import bisect_nightly, format_bisect_comment
 from external_deps import ensure_external_deps, format_external_deps_comment
-from predefined_scripts import (
-    check_predefined_mitigations,
-    format_predefined_comment,
-)
 
 SKIP_LABELS = {PROCESSING_LABEL, REPRO_SUCCESS_LABEL, REPRO_FAIL_LABEL}
 
@@ -248,7 +244,7 @@ def _has_clean_repro(issue_data: dict) -> bool:
     """Check if the issue has an explicit code block that looks like a repro."""
     body = issue_data.get("body", "")
     comments = issue_data.get("comments", [])
-    all_text = body + "\n".join(c.get("body", "") for c in comments)
+    all_text = body + "\n" + "\n".join(c.get("body", "") for c in comments)
     blocks = _extract_code_blocks(all_text)
     for block in blocks:
         if "import torch" in block or "torch.compile" in block or "torch._inductor" in block:
@@ -315,14 +311,14 @@ def build_comment(
     result: dict,
     owner_tags: str = "",
     bisect_section: str = "",
-    partner_section: str = "",
-    predefined_section: str = "",
+    external_section: str = "",
 ) -> str:
     classification = result["classification"]
     runs = f"{result['runs_failed']}/{result['runs_total']} failed"
     error_output = result["error_output"][:3000]
     repro_script = result["repro_script"]
     synthesized = result.get("synthesized_repro", False)
+    predefined_cat = result.get("predefined_category", "")
 
     if classification in ("REPRODUCED", "FLAKY"):
         emoji = "✅" if classification == "REPRODUCED" else "🔄"
@@ -340,8 +336,11 @@ def build_comment(
             f"🤖 **Inductor Agent — Predefined Mitigation Applied**\n\n"
             f"| Field | Value |\n|-------|-------|\n"
             f"| **Result** | 📋 {classification} |\n"
+            f"| **Category** | {predefined_cat} |\n"
             f"| **Reason** | {result['reason']} |\n"
-            f"| **Runs** | {runs} |\n"
+            f"| **Runs** | {runs} |\n\n"
+            f"<details>\n<summary>Reproduction script</summary>\n\n```python\n{repro_script}\n```\n</details>\n\n"
+            f"<details>\n<summary>Output</summary>\n\n```\n{error_output}\n```\n</details>"
         )
     elif classification == "SYNTHESIZED_REPRO":
         comment = (
@@ -365,8 +364,7 @@ def build_comment(
             f"<details>\n<summary>Output</summary>\n\n```\n{error_output}\n```\n</details>"
         )
 
-    # Append extra sections
-    for section in (bisect_section, partner_section, predefined_section):
+    for section in (bisect_section, external_section):
         if section:
             comment += f"\n\n{section}"
 
@@ -400,8 +398,7 @@ def process_issue(issue_number: int) -> None:
 
     result = None
     bisect_section = ""
-    partner_section = ""
-    predefined_section = ""
+    external_section = ""
 
     try:
         issue_dir = os.path.join(WORK_DIR, str(issue_number))
@@ -419,12 +416,12 @@ def process_issue(issue_number: int) -> None:
         # --- External dependencies ---
         external_results = ensure_external_deps(full_text)
         if external_results:
-            partner_section = format_external_deps_comment(external_results)
+            external_section = format_external_deps_comment(external_results)
             failed_deps = [g for g, ok in external_results.items() if not ok]
             if failed_deps:
                 logger.warning("Issue #%d: some external deps failed: %s", issue_number, failed_deps)
 
-        # --- Invoke Claude ---
+        # --- Invoke Claude (handles repro, predefined checks, everything) ---
         try:
             invoke_claude(issue_number, issue_dir, synthesize_repro=synthesize)
         except subprocess.TimeoutExpired:
@@ -448,22 +445,6 @@ def process_issue(issue_number: int) -> None:
         # Tag synthesized repros
         if synthesize and result["classification"] in ("REPRODUCED", "FLAKY"):
             result["synthesized_repro"] = True
-
-        # --- Predefined mitigation checks ---
-        repro_script = result.get("repro_script", "")
-        predefined_result = check_predefined_mitigations(full_text, repro_script, issue_dir)
-        if predefined_result and predefined_result.mitigation_applies:
-            predefined_section = format_predefined_comment(predefined_result)
-            if predefined_result.auto_close_eligible:
-                result["classification"] = "PREDEFINED_MITIGATION"
-                result["reason"] = (
-                    f"Predefined mitigation for '{predefined_result.matched_category}' "
-                    f"confirmed this is expected behavior."
-                )
-                logger.info("Issue #%d: predefined mitigation applies (%s)",
-                            issue_number, predefined_result.matched_category)
-        elif predefined_result:
-            predefined_section = format_predefined_comment(predefined_result)
 
         # --- Nightly bisection ---
         repro_path = os.path.join(issue_dir, "repro.py")
@@ -492,8 +473,7 @@ def process_issue(issue_number: int) -> None:
             result,
             owner_tags=owner_tags,
             bisect_section=bisect_section,
-            partner_section=partner_section,
-            predefined_section=predefined_section,
+            external_section=external_section,
         )
         gh_post_comment(issue_number, comment)
 
@@ -549,24 +529,13 @@ def auto_close_stale_repro_fails() -> None:
                     warning_time = datetime.fromisoformat(c["createdAt"].replace("Z", "+00:00"))
                 except (KeyError, ValueError):
                     pass
-            if bot_time is None and "Inductor Agent" in body and "Reproduction Failed" in body:
+            if bot_time is None and "Inductor Agent" in body and ("Reproduction Failed" in body or "Predefined Mitigation Applied" in body):
                 try:
                     bot_time = datetime.fromisoformat(c["createdAt"].replace("Z", "+00:00"))
                 except (KeyError, ValueError):
                     pass
             if bot_time and warning_time:
                 break
-
-        # Also check for predefined mitigation auto-close
-        if bot_time is None:
-            for c in reversed(comments):
-                body = c.get("body", "")
-                if "Inductor Agent" in body and "Predefined Mitigation Applied" in body:
-                    try:
-                        bot_time = datetime.fromisoformat(c["createdAt"].replace("Z", "+00:00"))
-                    except (KeyError, ValueError):
-                        pass
-                    break
 
         if not bot_time or bot_time > cutoff:
             continue
