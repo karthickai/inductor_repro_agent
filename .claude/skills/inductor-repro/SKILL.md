@@ -1,38 +1,389 @@
 ---
 name: inductor-repro
-description: Reproduce a PyTorch Inductor GitHub issue. Reads issue data from a local file, writes and runs a repro script in the pytorch-nightly conda env, detects common issue categories, and writes a result.json file.
+description: "Reproduce a PyTorch Inductor GitHub issue. Fetches issue from GitHub (or reads from local file), sets up pytorch-nightly env, writes and runs a repro script, detects common issue categories, and writes a result.json."
+user-invocable: true
+model-invocable: true
+allowed-tools: Read, Write, Bash, AskUserQuestion
 ---
 
 # Reproduce a PyTorch Inductor Issue
 
-Read a GitHub issue from a local JSON file, write a repro script, run it 3 times, identify affected areas, and write a `result.json`.
-
-**You have NO network access.** Everything you need is in local files.
+Automatically reproduce a PyTorch Inductor GitHub issue: fetch it, set up the
+environment, write a repro script, run it 3×, classify the result, and write
+`result.json`.
 
 ## Inputs
 
-- The **issue number** (e.g., `1`)
-- The **path to `issue.json`** (e.g., `workdir/1/issue.json`)
+The user or pipeline provides some combination of:
 
-Replace `{N}` with the actual issue number in all commands.
+| Input | Example | Effect |
+|-------|---------|--------|
+| **Issue URL or number** | `https://github.com/pytorch/pytorch/issues/12345` or `12345` | Skill fetches issue via `gh` |
+| **`issue.json` path** | `/tmp/workdir/12345/issue.json` | Skill reads directly, skips fetch |
+| **`ENV_NAME`** | `pytorch-nightly` or `my-dev-env` | Skill uses this env, skips env discovery |
+| **`WORK_DIR`** | `/tmp/inductor_repro_workdir` | Skill uses this directory |
 
-## Steps
+**The more inputs you provide, the more steps get skipped:**
+- Provide nothing but issue number → skill does everything (find env, fetch issue, repro)
+- Provide `ENV_NAME` + issue number → skill skips env discovery (Step 0b)
+- Provide `ENV_NAME` + `issue.json` path → skill skips env discovery AND issue fetch (Step 0b, Step 1)
 
-### 1. Read the issue and detect category
+## Step 0: Environment Setup
 
-Read `issue.json`. Look at both `body` and `comments` for:
+Before doing anything else, validate the environment. Each check is a gate —
+if it fails, try to fix it or ask the user.
+
+### 0a. Determine the work directory
+
+```bash
+WORK_DIR="${WORK_DIR:-/tmp/inductor_repro_workdir}"
+mkdir -p "$WORK_DIR"
+```
+
+### 0b. Determine the conda environment
+
+The skill needs a conda environment with PyTorch installed.
+
+**If `ENV_NAME` is provided** (as input, environment variable, or by the user),
+use it directly and jump to Step 0c.
+
+**If `ENV_NAME` is NOT provided**, ask the user:
+
+> I need a conda environment with PyTorch to reproduce this issue. Options:
+>
+> 1. **Provide your env name** — if you already have one (e.g., `pytorch-nightly`, `my-dev-env`)
+> 2. **I'll create one for you** — I'll create a `pytorch-nightly` conda env
+>    and install the latest PyTorch nightly (auto-detects GPU/CPU)
+> 3. **Create it yourself** — run these commands, then give me the env name:
+>    ```bash
+>    conda create -y -n pytorch-nightly python=3.12
+>    # For GPU (check your CUDA version with nvidia-smi):
+>    conda run -n pytorch-nightly pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu126
+>    # For CPU only:
+>    conda run -n pytorch-nightly pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cpu
+>    ```
+
+**If user picks option 2 (auto-create):**
+
+Detect hardware and create the env:
+
+```bash
+conda create -y -n pytorch-nightly python=3.12
+```
+
+```bash
+# Detect GPU
+nvidia-smi > /dev/null 2>&1
+```
+
+If GPU available — read CUDA version and map to the correct nightly index:
+```bash
+CUDA_MAJOR_MINOR=$(nvidia-smi | grep -oP 'CUDA Version: \K[\d.]+')
+echo "Detected CUDA: $CUDA_MAJOR_MINOR"
+```
+
+| Driver CUDA Version | PyTorch index |
+|---------------------|---------------|
+| 12.6.x | `cu126` |
+| 12.8.x | `cu128` |
+| 13.0.x | `cu130` |
+
+Pick the **highest `cuXYZ` that does not exceed** the driver CUDA version.
+If unsure, default to `cu126` (widely compatible).
+
+```bash
+conda run -n pytorch-nightly pip install --pre torch torchvision torchaudio \
+  --index-url https://download.pytorch.org/whl/nightly/cu${CUDA_TAG}
+```
+
+If no GPU:
+```bash
+conda run -n pytorch-nightly pip install --pre torch torchvision torchaudio \
+  --index-url https://download.pytorch.org/whl/nightly/cpu
+```
+
+Set `ENV_NAME=pytorch-nightly`.
+
+### 0c. Validate the environment (smoke test)
+
+Run this against whatever `ENV_NAME` was determined in Step 0b:
+
+```bash
+conda run -n ${ENV_NAME} python -c "
+import torch
+print(f'PyTorch version: {torch.__version__}')
+print(f'CUDA available:  {torch.cuda.is_available()}')
+
+if torch.cuda.is_available():
+    print(f'CUDA version:    {torch.version.cuda}')
+    print(f'GPU:             {torch.cuda.get_device_name(0)}')
+    try:
+        import triton
+        print(f'Triton version:  {triton.__version__}')
+    except ImportError:
+        print('WARNING: Triton not installed — will attempt to install')
+
+    # Smoke test: compile + run on GPU
+    @torch.compile
+    def _smoke(x):
+        return x + 1
+    _smoke(torch.randn(4, device='cuda'))
+    print('Inductor smoke test (CUDA): PASS')
+else:
+    print('No CUDA — running CPU-only mode')
+    @torch.compile
+    def _smoke(x):
+        return x + 1
+    _smoke(torch.randn(4))
+    print('Inductor smoke test (CPU): PASS')
+"
+```
+
+**Handle failures intelligently.**
+
+The smoke test captures stderr/stdout. **Read the actual error message,
+diagnose the root cause, and attempt to fix it.** Don't guess — the error
+tells you exactly what's wrong.
+
+Run the smoke test with full error capture:
+
+```bash
+conda run -n ${ENV_NAME} python -c "
+import sys, traceback
+
+# Phase 1: torch import
+try:
+    import torch
+    print(f'PyTorch version: {torch.__version__}')
+    print(f'CUDA available:  {torch.cuda.is_available()}')
+except ImportError as e:
+    print(f'FAIL_PHASE: torch_import')
+    print(f'ERROR: {e}')
+    sys.exit(1)
+
+# Phase 2: CUDA setup (if available)
+if torch.cuda.is_available():
+    try:
+        print(f'CUDA version:    {torch.version.cuda}')
+        print(f'GPU:             {torch.cuda.get_device_name(0)}')
+    except Exception as e:
+        print(f'FAIL_PHASE: cuda_init')
+        print(f'ERROR: {e}')
+        traceback.print_exc()
+        sys.exit(2)
+
+    try:
+        import triton
+        print(f'Triton version:  {triton.__version__}')
+    except ImportError:
+        print(f'FAIL_PHASE: triton_import')
+        sys.exit(3)
+
+# Phase 3: torch.compile smoke test
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+try:
+    @torch.compile
+    def _smoke(x):
+        return x + 1
+    _smoke(torch.randn(4, device=device))
+    print(f'Inductor smoke test ({device}): PASS')
+except Exception as e:
+    print(f'FAIL_PHASE: inductor_compile')
+    print(f'ERROR: {type(e).__name__}: {e}')
+    traceback.print_exc()
+    sys.exit(4)
+" 2>&1
+SMOKE_EXIT=$?
+```
+
+**Diagnose and fix based on exit code and error output:**
+
+**Exit 0 — PASS:** Environment is ready. Proceed to Step 1.
+
+**Exit 1 — `torch` import failed:**
+Read the error. Common causes:
+- `ModuleNotFoundError: No module named 'torch'` → torch not installed:
+  ```bash
+  conda run -n ${ENV_NAME} pip install --pre torch torchvision torchaudio \
+    --index-url https://download.pytorch.org/whl/nightly/cu126
+  ```
+- `ImportError: libcudart.so.XX: cannot open shared object file` → CUDA libs missing.
+  Reinstall with correct CUDA version (check `nvidia-smi`).
+- Other ImportError → read the message, it tells you what's missing.
+
+Re-run smoke test after fix.
+
+**Exit 2 — CUDA initialization failed:**
+Read the error. Common causes:
+- `CUDA error: no kernel image is available for execution on the device` →
+  PyTorch CUDA version doesn't match driver. Compare:
+  ```bash
+  nvidia-smi | grep "CUDA Version"   # Driver supports up to this
+  conda run -n ${ENV_NAME} python -c "import torch; print(torch.version.cuda)"  # PyTorch built for this
+  ```
+  Fix: reinstall torch with the correct CUDA index matching your driver.
+- `CUDA error: out of memory` → GPU memory full. Run `nvidia-smi` to check,
+  kill other processes, or ask user.
+- `RuntimeError: CUDA unknown error` → driver issue. Tell user to check `nvidia-smi`.
+
+**Exit 3 — Triton not installed:**
+```bash
+conda run -n ${ENV_NAME} pip install triton
+```
+Re-run smoke test.
+
+**Exit 4 — `torch.compile` / inductor failed:**
+This is the most informative failure. The traceback shows exactly what broke
+in the inductor pipeline. **Read the full traceback carefully.** Common causes:
+
+- `torch._dynamo.exc.BackendCompilerFailed` → inductor backend bug. Read the
+  inner exception. This could be a genuine inductor bug in this nightly build.
+- `triton.compiler.errors.CompilationError` → Triton codegen issue. May be a
+  version mismatch between torch and triton.
+- `CppCompileError` → C++ compiler issue. Check if `gcc`/`g++` is available.
+- `subprocess.CalledProcessError` → compilation subprocess failed. Read stderr.
+
+For inductor compile failures, ask the user:
+> `torch.compile` failed on a trivial function. This indicates an issue with
+> the inductor backend in this nightly build, NOT your issue's code.
+>
+> Error: `{type}: {message}`
+> Full traceback: (show it)
+>
+> Options:
+> 1. **Try an older nightly** — yesterday's build may not have this bug
+> 2. **Proceed anyway** — your issue may use a different code path that works
+> 3. **Switch to CPU** — test without CUDA (some issues are CPU-reproducible)
+
+**`conda` not found:**
+Ask user:
+> `conda` command not found. Options:
+> 1. Install miniconda: `curl -sL https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh | bash`
+> 2. Provide an existing virtualenv with PyTorch nightly
+
+**General principle:** Always read the actual error output. Classify which
+phase failed, read the exception type and message, then apply the specific
+fix. If you can fix it programmatically, do it and re-run. If you can't,
+show the user the exact error with actionable options.
+
+**Use `ENV_NAME` for ALL subsequent commands** instead of hardcoding `pytorch-nightly`.
+From this point on, all commands use:
+```bash
+conda run -n ${ENV_NAME} python ...
+```
+
+### 0d. Install external dependencies (if needed)
+
+After fetching the issue (Step 1), scan the issue text for import markers.
+If any of these libraries are referenced, install them.
+
+**CRITICAL: Record the torch version BEFORE installing any external package.**
+Some packages (e.g., `transformers`, `accelerate`) can silently downgrade or
+replace PyTorch with a stable release, breaking the nightly.
+
+```bash
+# Record current torch version BEFORE installing anything
+TORCH_BEFORE=$(conda run -n ${ENV_NAME} python -c "import torch; print(torch.__version__)")
+echo "Torch version before: $TORCH_BEFORE"
+```
+
+| Library | Import markers | Packages to install |
+|---------|---------------|---------------------|
+| **transformers** | `import transformers`, `from transformers` | `transformers accelerate datasets` |
+| **diffusers** | `import diffusers`, `from diffusers` | `diffusers transformers accelerate` |
+| **timm** | `import timm`, `from timm` | `timm` |
+
+Install with `--no-deps` on torch-related packages to prevent PyTorch replacement,
+then install remaining deps normally:
+
+```bash
+conda run -n ${ENV_NAME} pip install --quiet --no-deps <packages>
+conda run -n ${ENV_NAME} pip install --quiet <packages> 2>&1 || true
+```
+
+**After install — verify torch was NOT replaced:**
+
+```bash
+TORCH_AFTER=$(conda run -n ${ENV_NAME} python -c "import torch; print(torch.__version__)")
+echo "Torch version after: $TORCH_AFTER"
+if [ "$TORCH_BEFORE" != "$TORCH_AFTER" ]; then
+    echo "WARNING: PyTorch was changed from $TORCH_BEFORE to $TORCH_AFTER!"
+    echo "Restoring nightly..."
+    conda run -n ${ENV_NAME} pip install --pre --force-reinstall torch torchvision torchaudio \
+      --index-url https://download.pytorch.org/whl/nightly/cu126
+fi
+```
+
+**Verify the external package imports correctly:**
+```bash
+conda run -n ${ENV_NAME} python -c "import <package>; print(<package>.__version__)"
+```
+
+**Note on issue-reported PyTorch version:** The issue may report a specific
+torch version (e.g., "this happens on torch 2.6.0"). For now, **always use the
+latest nightly** — if the bug doesn't reproduce, bisection (run separately by
+main.py) will find which version introduced/fixed it.
+
+---
+
+## Step 1: Fetch the issue
+
+### Option A: GitHub URL or issue number provided
+
+Try to fetch the issue using `gh`:
+
+```bash
+gh issue view {N} --repo pytorch/pytorch --json title,body,labels,comments,state,author
+```
+
+**If `gh` succeeds:** Save the output to `$WORK_DIR/{N}/issue.json`.
+
+**If `gh` fails** (auth error, network restricted, `gh` not installed):
+
+Ask the user:
+> I couldn't fetch the issue from GitHub. This can happen if:
+> - `gh` CLI is not installed or not authenticated
+> - Network access is restricted
+>
+> You can either:
+> 1. Run `gh auth login` to authenticate, then I'll retry
+> 2. Paste the issue content directly here
+> 3. Provide a path to a pre-fetched `issue.json` file
+>
+> To fetch it yourself:
+> ```bash
+> gh issue view {N} --repo pytorch/pytorch --json title,body,labels,comments > issue.json
+> ```
+
+### Option B: Local `issue.json` path provided
+
+Read the file directly. This is the path used when main.py pipeline has
+already fetched the issue.
+
+### Save issue data
+
+```bash
+mkdir -p $WORK_DIR/{N}
+```
+
+Write or copy the issue data to `$WORK_DIR/{N}/issue.json`.
+
+---
+
+## Step 2: Analyze the issue and detect categories
+
+Read the issue JSON. Look at both `body` and `comments` for:
 - Code snippets (in ``` code blocks)
-- Stack traces
-- Error messages
-- Descriptions of the problem (even if no code is provided)
+- Stack traces and error messages
+- Descriptions of the problem
 
 **Classify the issue content:**
-- **Has code blocks with `import torch` / `torch.compile`** → proceed to Step 2 (standard repro)
-- **Has code fragments but incomplete** → proceed to Step 2a (synthesize repro)
-- **Has only descriptions / error messages, no code** → proceed to Step 2a (synthesize repro)
+- **Has code blocks with `import torch` / `torch.compile`** → proceed to Step 3 (standard repro)
+- **Has code fragments but incomplete** → proceed to Step 3a (synthesize repro)
+- **Has only descriptions / error messages, no code** → proceed to Step 3a (synthesize repro)
 
 **Detect predefined categories** by scanning the issue text for keywords.
-If 2 or more keywords from any category below match, that category applies.
+If 2+ keywords from any category below match, that category applies.
 Multiple categories can apply; prioritize the one with the most keyword matches.
 
 ---
@@ -104,22 +455,23 @@ torch._dynamo.exc.Unsupported
 
 ---
 
-### 2. Write the repro script (standard path)
+**After analyzing:** Go back to Step 0d to install any external dependencies
+detected in the issue text before writing the repro script.
 
-```bash
-mkdir -p workdir/{N}
-```
+---
 
-Write `workdir/{N}/repro.py`:
+## Step 3: Write the repro script (standard path)
+
+Write `$WORK_DIR/{N}/repro.py`:
 - Complete, self-contained, all imports included
 - Use the exact code from the issue
 - Do NOT download model weights or datasets
 - If a predefined category was detected, include the extra checks
   described in that category's "What to do" section
 
-Proceed to Step 3.
+Proceed to Step 4.
 
-### 2a. Synthesize a repro script (no clean code provided)
+## Step 3a: Synthesize a repro script (no clean code provided)
 
 When the issue does NOT contain a clean repro script, you MUST attempt to
 create one from the available information:
@@ -163,16 +515,18 @@ if isinstance(eager_out, torch.Tensor):
 ```
 
 3. If a predefined category was detected, include those extra checks too
-4. Write the synthesized script to `workdir/{N}/repro.py`
-5. Proceed to Step 3
+4. Write the synthesized script to `$WORK_DIR/{N}/repro.py`
+5. Proceed to Step 4
 
-### 3. Run 3 times
+---
+
+## Step 4: Run 3 times
 
 ```bash
-TORCH_INDUCTOR_DISABLE_CACHE=1 conda run -n pytorch-nightly python workdir/{N}/repro.py
+TORCH_INDUCTOR_DISABLE_CACHE=1 conda run -n ${ENV_NAME} python $WORK_DIR/{N}/repro.py
 ```
 
-Classify:
+Run 3 times. Classify:
 
 | Result | Condition |
 |---|---|
@@ -194,13 +548,11 @@ classify as `SYNTHESIZED_REPRO` rather than `DIFFERENT_ERROR`.
 (< 1e-6) and consistent across all 3 runs, classify as `PREDEFINED_MITIGATION`
 with a clear reason explaining this is expected behavior.
 
-### 4. Identify affected areas
+---
 
-Read `codeowners.py` (in the project root). Based on the traceback and error type, pick matching areas. Include them in `result.json`.
+## Step 5: Write result.json
 
-### 5. Write result.json
-
-Write `workdir/{N}/result.json`:
+Write `$WORK_DIR/{N}/result.json`:
 
 ```json
 {
@@ -210,10 +562,12 @@ Write `workdir/{N}/result.json`:
   "runs_total": 3,
   "error_output": "stderr from last run (up to 3000 chars)",
   "repro_script": "contents of repro.py",
-  "matched_areas": ["Dynamic Shapes", "Lowering"],
   "synthesized_repro": false,
   "external_deps_needed": [],
-  "predefined_category": ""
+  "predefined_category": "",
+  "torch_version": "2.7.0.dev20260330",
+  "cuda_available": true,
+  "gpu_name": "NVIDIA A100-SXM4-80GB"
 }
 ```
 
@@ -223,32 +577,55 @@ Write `workdir/{N}/result.json`:
 - `runs_failed` / `runs_total` (int): run counts
 - `error_output` (str): stderr/stdout from last run (up to 3000 chars)
 - `repro_script` (str): full contents of the repro script
-- `matched_areas` (list[str]): areas from codeowners.py
 - `synthesized_repro` (bool): true if you created the repro from descriptions
 - `external_deps_needed` (list[str]): e.g. `["transformers", "timm"]`
 - `predefined_category` (str): e.g. `"numerical_tolerance"`, `"precision_cast"`, `""` if none
+- `torch_version` (str): the PyTorch version used for reproduction
+- `cuda_available` (bool): whether CUDA was available
+- `gpu_name` (str): GPU name if CUDA available, else `""`
 
 **This file is mandatory.** Always write it, even on failure.
 
-### 6. Print summary
+---
+
+## Step 6: Print summary
 
 ```
 === INDUCTOR AGENT RESULT ===
 Issue:         #{N}
 Result:        {classification}
 Runs:          {runs_failed}/{runs_total} failed
-Env:           pytorch-nightly
+Torch:         {torch_version}
+GPU:           {gpu_name or "CPU-only"}
 Synthesized:   {yes/no}
 Category:      {predefined_category or none}
 External deps: {list or none}
+Work dir:      $WORK_DIR/{N}/
 ===========================
 ```
 
+---
+
+## How `main.py` Pipeline Uses This Skill
+
+When `main.py` calls this skill, it provides:
+- `ENV_NAME=pytorch-nightly` (already validated, fresh, deps installed)
+- `WORK_DIR=/tmp/inductor_repro_workdir`
+- `issue.json` path (already fetched from GitHub)
+
+The skill sees `ENV_NAME` is set → skips env discovery (Step 0b).
+Sees `issue.json` exists → skips fetch (Step 1).
+Goes straight to Step 0c (smoke test) → Step 2 (analyze) → Step 3 (repro).
+
+---
+
 ## Constraints
 
-- **No network.** No `gh`, `curl`, `wget`.
-- **Use `conda run -n pytorch-nightly`** for all commands.
+- **Use `conda run -n ${ENV_NAME}`** for all Python execution (`ENV_NAME` defaults to `pytorch-nightly`).
 - **Never modify the pytorch source tree.**
-- **Always write result.json.**
+- **Always write result.json** — even on failure.
 - **Always attempt a repro** — even if there's no clean code, try to synthesize one.
-- **Always check for predefined categories** — scan the issue text for keywords and follow the category instructions.
+- **Always check for predefined categories** — scan issue text for keywords.
+- **Be intelligent about the environment** — detect hardware, install matching packages.
+- **Ask the user when stuck** — don't fail silently. If something is wrong, explain what
+  happened and offer options.
