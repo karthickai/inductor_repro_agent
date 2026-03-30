@@ -23,10 +23,6 @@ The user or pipeline provides some combination of:
 | **`ENV_NAME`** | `pytorch-nightly` or `my-dev-env` | Skill uses this env, skips env discovery |
 | **`WORK_DIR`** | `/tmp/inductor_repro_workdir` | Skill uses this directory |
 
-**The more inputs you provide, the more steps get skipped:**
-- Provide nothing but issue number → skill does everything (find env, fetch issue, repro)
-- Provide `ENV_NAME` + issue number → skill skips env discovery (Step 0b)
-- Provide `ENV_NAME` + `issue.json` path → skill skips env discovery AND issue fetch (Step 0b, Step 1)
 
 ## Step 0: Environment Setup
 
@@ -47,7 +43,7 @@ The skill needs a conda environment with PyTorch installed.
 **If `ENV_NAME` is provided** (as input, environment variable, or by the user),
 use it directly and jump to Step 0c.
 
-**If `ENV_NAME` is NOT provided**, ask the user:
+**If `ENV_NAME` is NOT provided**, ask the user (**CRITICAL**):
 
 > I need a conda environment with PyTorch to reproduce this issue. Options:
 >
@@ -106,46 +102,7 @@ Set `ENV_NAME=pytorch-nightly`.
 
 ### 0c. Validate the environment (smoke test)
 
-Run this against whatever `ENV_NAME` was determined in Step 0b:
-
-```bash
-conda run -n ${ENV_NAME} python -c "
-import torch
-print(f'PyTorch version: {torch.__version__}')
-print(f'CUDA available:  {torch.cuda.is_available()}')
-
-if torch.cuda.is_available():
-    print(f'CUDA version:    {torch.version.cuda}')
-    print(f'GPU:             {torch.cuda.get_device_name(0)}')
-    try:
-        import triton
-        print(f'Triton version:  {triton.__version__}')
-    except ImportError:
-        print('WARNING: Triton not installed — will attempt to install')
-
-    # Smoke test: compile + run on GPU
-    @torch.compile
-    def _smoke(x):
-        return x + 1
-    _smoke(torch.randn(4, device='cuda'))
-    print('Inductor smoke test (CUDA): PASS')
-else:
-    print('No CUDA — running CPU-only mode')
-    @torch.compile
-    def _smoke(x):
-        return x + 1
-    _smoke(torch.randn(4))
-    print('Inductor smoke test (CPU): PASS')
-"
-```
-
-**Handle failures intelligently.**
-
-The smoke test captures stderr/stdout. **Read the actual error message,
-diagnose the root cause, and attempt to fix it.** Don't guess — the error
-tells you exactly what's wrong.
-
-Run the smoke test with full error capture:
+Run this against `ENV_NAME`:
 
 ```bash
 conda run -n ${ENV_NAME} python -c "
@@ -193,7 +150,6 @@ except Exception as e:
     traceback.print_exc()
     sys.exit(4)
 " 2>&1
-SMOKE_EXIT=$?
 ```
 
 **Diagnose and fix based on exit code and error output:**
@@ -249,11 +205,7 @@ For inductor compile failures, ask the user:
 >
 > Error: `{type}: {message}`
 > Full traceback: (show it)
->
-> Options:
-> 1. **Try an older nightly** — yesterday's build may not have this bug
-> 2. **Proceed anyway** — your issue may use a different code path that works
-> 3. **Switch to CPU** — test without CUDA (some issues are CPU-reproducible)
+
 
 **`conda` not found:**
 Ask user:
@@ -266,7 +218,7 @@ phase failed, read the exception type and message, then apply the specific
 fix. If you can fix it programmatically, do it and re-run. If you can't,
 show the user the exact error with actionable options.
 
-**Use `ENV_NAME` for ALL subsequent commands** instead of hardcoding `pytorch-nightly`.
+**Use `ENV_NAME` for ALL subsequent commands.**
 From this point on, all commands use:
 ```bash
 conda run -n ${ENV_NAME} python ...
@@ -321,8 +273,7 @@ conda run -n ${ENV_NAME} python -c "import <package>; print(<package>.__version_
 
 **Note on issue-reported PyTorch version:** The issue may report a specific
 torch version (e.g., "this happens on torch 2.6.0"). For now, **always use the
-latest nightly** — if the bug doesn't reproduce, bisection (run separately by
-main.py) will find which version introduced/fixed it.
+latest nightly**.
 
 ---
 
@@ -405,51 +356,7 @@ max diff, precision, incorrect output, wrong result
 
 ---
 
-#### Category: `precision_cast`
-
-**Keywords:** float16, fp16, bfloat16, bf16, half precision, mixed precision,
-autocast, amp, precision loss, cast, dtype mismatch
-
-**What to do:** In your repro script, you MUST:
-1. Test the operation in `float32`, `float16`, and `bfloat16`
-2. Compare eager vs compiled at each dtype
-3. Also test precision-cast roundtrip: cast `fp32→low→fp32` in eager,
-   compare against straight `fp32` eager to show inherent precision loss
-4. Compare the compile diff against the cast-roundtrip diff
-5. If compile diff is < **1e-6**, classify as `PREDEFINED_MITIGATION`
-   with `predefined_category = "precision_cast"`
-
-**Auto-close eligible:** Yes
-
----
-
-#### Category: `dynamic_shapes_guard`
-
-**Keywords:** guard, dynamic shape, symbolic, Unsupported: dynamic, SymInt,
-data-dependent, GuardOnDataDependentSymNode
-
-**What to do:** In your repro script, you MUST:
-1. Test with both static and dynamic inputs
-2. Try `torch._dynamo.mark_dynamic()` on varying dimensions
-3. Check if the error changes with
-   `torch._dynamo.config.capture_scalar_outputs = True`
-4. Report which workarounds help (if any) in the result reason
-5. Do NOT classify as `PREDEFINED_MITIGATION` — classify normally
-
-**Auto-close eligible:** No
-
----
-
-#### Category: `graph_break`
-
-**Keywords:** graph break, graph_break, Unsupported:, skipping,
-torch._dynamo.exc.Unsupported
-
-**What to do:** In your repro script, you MUST:
-1. Add `torch._dynamo.explain()` output
-2. Try compiling with `fullgraph=False` and `fullgraph=True`
-3. Report the graph break reason in the result
-4. Do NOT classify as `PREDEFINED_MITIGATION` — classify normally
+#### For other category
 
 **Auto-close eligible:** No
 
@@ -465,7 +372,6 @@ detected in the issue text before writing the repro script.
 Write `$WORK_DIR/{N}/repro.py`:
 - Complete, self-contained, all imports included
 - Use the exact code from the issue
-- Do NOT download model weights or datasets
 - If a predefined category was detected, include the extra checks
   described in that category's "What to do" section
 
@@ -565,9 +471,9 @@ Write `$WORK_DIR/{N}/result.json`:
   "synthesized_repro": false,
   "external_deps_needed": [],
   "predefined_category": "",
-  "torch_version": "2.7.0.dev20260330",
-  "cuda_available": true,
-  "gpu_name": "NVIDIA A100-SXM4-80GB"
+  "torch_version": "<from torch.__version__>",
+  "cuda_available": "<from torch.cuda.is_available()>",
+  "gpu_name": "<from torch.cuda.get_device_name(0) or empty string>"
 }
 ```
 
@@ -603,19 +509,6 @@ External deps: {list or none}
 Work dir:      $WORK_DIR/{N}/
 ===========================
 ```
-
----
-
-## How `main.py` Pipeline Uses This Skill
-
-When `main.py` calls this skill, it provides:
-- `ENV_NAME=pytorch-nightly` (already validated, fresh, deps installed)
-- `WORK_DIR=/tmp/inductor_repro_workdir`
-- `issue.json` path (already fetched from GitHub)
-
-The skill sees `ENV_NAME` is set → skips env discovery (Step 0b).
-Sees `issue.json` exists → skips fetch (Step 1).
-Goes straight to Step 0c (smoke test) → Step 2 (analyze) → Step 3 (repro).
 
 ---
 
